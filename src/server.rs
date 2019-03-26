@@ -32,6 +32,9 @@ use crate::error::{Error, Result};
 use crate::task::{CallTag, CqFuture};
 use crate::RpcContext;
 
+#[cfg(unix)]
+use std::fs;
+
 const DEFAULT_REQUEST_SLOTS_PER_CQ: usize = 1024;
 
 /// An RPC call holder.
@@ -142,8 +145,45 @@ mod imp {
         }
     }
 }
+#[cfg(unix)]
+mod imp_unix {
+    use grpc_sys::{self, GrpcServer};
+    use std::os::unix::io::AsRawFd;
+    use std::os::unix::net::UnixListener;
+    use std::path::Path;
+    use std::ptr;
+
+    pub struct UnixDomainBinder {
+        pub socket_path: String,
+    }
+
+    impl UnixDomainBinder {
+        pub fn new(socket_path: String) -> UnixDomainBinder {
+            UnixDomainBinder { socket_path }
+        }
+
+        pub unsafe fn bind(&mut self, server: *mut GrpcServer) -> String {
+            let socket_path = Path::new(&self.socket_path);
+            match UnixListener::bind(&socket_path) {
+                Ok(sock) => {
+                    grpc_sys::grpc_server_add_insecure_channel_from_fd(
+                        server,
+                        ptr::null_mut(),
+                        sock.as_raw_fd(),
+                    );
+                }
+                Err(e) => {
+                    panic!("Can't bind UNIX domain socket: {:?}", e);
+                }
+            }
+            self.socket_path.to_string()
+        }
+    }
+}
 
 use self::imp::Binder;
+#[cfg(unix)]
+use self::imp_unix::UnixDomainBinder;
 
 /// [`Service`] factory in order to configure the properties.
 ///
@@ -262,6 +302,8 @@ pub struct Service {
 pub struct ServerBuilder {
     env: Arc<Environment>,
     binders: Vec<Binder>,
+    #[cfg(unix)]
+    binders_unix: Vec<UnixDomainBinder>,
     args: Option<ChannelArgs>,
     slots_per_cq: usize,
     handlers: HashMap<&'static [u8], BoxHandler>,
@@ -273,6 +315,7 @@ impl ServerBuilder {
         ServerBuilder {
             env,
             binders: Vec::new(),
+            binders_unix: Vec::new(),
             args: None,
             slots_per_cq: DEFAULT_REQUEST_SLOTS_PER_CQ,
             handlers: HashMap::new(),
@@ -284,6 +327,16 @@ impl ServerBuilder {
     /// This function can be called multiple times to bind to multiple ports.
     pub fn bind<S: Into<String>>(mut self, host: S, port: u16) -> ServerBuilder {
         self.binders.push(Binder::new(host.into(), port));
+        self
+    }
+
+    /// Bind to a UNIX domain socket.
+    ///
+    /// This function can be called multiple times to bind to multiple sockets.
+    #[cfg(unix)]
+    pub fn bind_unix<S: Into<String>>(mut self, socket_path: S) -> ServerBuilder {
+        self.binders_unix
+            .push(UnixDomainBinder::new(socket_path.into()));
         self
     }
 
@@ -325,6 +378,20 @@ impl ServerBuilder {
                 bind_addrs.push((binder.host, bind_port as u16));
             }
 
+            let mut bind_unix_addrs = Vec::with_capacity(self.binders_unix.len());
+            #[cfg(unix)]
+            {
+                for mut binder in self.binders_unix.drain(..) {
+                    let bind_path = binder.bind(server);
+                    if bind_path.is_empty() {
+                        grpc_sys::grpc_server_destroy(server);
+                        return Err(Error::BindFail(binder.socket_path, 0));
+                    }
+
+                    bind_unix_addrs.push(binder.socket_path);
+                }
+            }
+
             for cq in self.env.completion_queues() {
                 let cq_ref = cq.borrow()?;
                 grpc_sys::grpc_server_register_completion_queue(
@@ -340,6 +407,7 @@ impl ServerBuilder {
                     server,
                     shutdown: AtomicBool::new(false),
                     bind_addrs,
+                    bind_unix_addrs,
                     slots_per_cq: self.slots_per_cq,
                 }),
                 handlers: self.handlers,
@@ -373,13 +441,18 @@ mod secure_server {
 struct ServerCore {
     server: *mut GrpcServer,
     bind_addrs: Vec<(String, u16)>,
+    bind_unix_addrs: Vec<String>,
     slots_per_cq: usize,
     shutdown: AtomicBool,
 }
 
 impl Drop for ServerCore {
     fn drop(&mut self) {
-        unsafe { grpc_sys::grpc_server_destroy(self.server) }
+        for binder in self.bind_unix_addrs.drain(..) {
+            fs::remove_file(&binder).expect(&format!("can't remove file {}", binder));
+        }
+        unsafe { grpc_sys::grpc_server_destroy(self.server) };
+
     }
 }
 
@@ -516,6 +589,11 @@ impl Server {
     pub fn bind_addrs(&self) -> &[(String, u16)] {
         &self.core.bind_addrs
     }
+
+    // Get binded UNIX domain sockets.
+    pub fn bind_unix_addrs(&self) -> &[String] {
+        &self.core.bind_unix_addrs
+    }
 }
 
 impl Drop for Server {
@@ -530,7 +608,11 @@ impl Drop for Server {
 
 impl Debug for Server {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        write!(f, "Server {:?}", self.core.bind_addrs)
+        write!(
+            f,
+            "Server {:?} {:?}",
+            self.core.bind_addrs, self.core.bind_unix_addrs
+        )
     }
 }
 

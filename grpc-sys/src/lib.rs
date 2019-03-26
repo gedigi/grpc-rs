@@ -564,6 +564,11 @@ extern "C" {
         reserved: *mut c_void,
     ) -> *mut GrpcCall;
     pub fn grpc_channel_get_target(channel: *mut GrpcChannel) -> *mut c_char;
+    pub fn grpc_insecure_channel_create_from_fd(
+        target: *const c_char,
+        fd: c_int,
+        args: *const GrpcChannelArgs,
+    ) -> *mut GrpcChannel;
     pub fn grpc_insecure_channel_create(
         target: *const c_char,
         args: *const GrpcChannelArgs,
@@ -729,6 +734,11 @@ extern "C" {
         server: *mut GrpcServer,
         cq: *mut GrpcCompletionQueue,
         reserved: *mut c_void,
+    );
+    pub fn grpc_server_add_insecure_channel_from_fd(
+        server: *mut GrpcServer,
+        reserved: *mut c_void,
+        fd: c_int,
     );
     pub fn grpc_server_add_insecure_http2_port(
         server: *mut GrpcServer,
